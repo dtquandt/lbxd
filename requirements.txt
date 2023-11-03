@@ -1,4 +1,3 @@
 pandas
 letterboxd
 pybase62
-python-dotenv

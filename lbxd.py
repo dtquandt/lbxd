@@ -1,14 +1,10 @@
 import os
-
 import letterboxd
 import requests
 import pandas as pd
 import base62
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dotenv import load_dotenv
-
-load_dotenv()
 
 def api_request(path: str):
     """
