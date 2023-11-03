@@ -1,0 +1,4 @@
+pandas
+letterboxd
+base62
+python-dotenv
