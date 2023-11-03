@@ -7,5 +7,5 @@ setup(
    author='Daniel Quandt',
    author_email='danieltquandt@gmail.com',
    packages=['lbxd'],  #same as name
-   install_requires=['pandas', 'base62', 'letterboxd', 'python-dotenv'], #external packages as dependencies
+   install_requires=['pandas', 'pybase62', 'letterboxd', 'python-dotenv'], #external packages as dependencies
 )
