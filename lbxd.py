@@ -6,6 +6,9 @@ import pandas as pd
 import base62
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dotenv import load_dotenv
+
+load_dotenv()
 
 def api_request(path: str):
     """
@@ -21,8 +24,8 @@ def api_request(path: str):
     requests.models.Response
         The response from the API.
     """
-    LBXD_KEY = os.getenv('LBXD_KEY')
-    LBXD_SECRET = os.getenv('LBXD_SECRET')
+    LBXD_KEY = os.environ['LBXD_KEY']
+    LBXD_SECRET = os.environ['LBXD_SECRET']
     API_BASE = 'https://api.letterboxd.com/api/v0'
     
     return letterboxd.api.API(api_base=API_BASE, api_key=LBXD_KEY, api_secret=LBXD_SECRET).api_call(path)
