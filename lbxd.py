@@ -222,6 +222,25 @@ def threaded_api_request(url_list, max_retries=15, max_threads=50, print_every=1
     return all_results, missing_urls, failed_urls
 
 
+def get_member_info(member_id):
+    """
+    Return a member's info from the Letterboxd API.
+    
+    Parameters
+    ----------
+    member_id : str
+        The member ID of the member whose info you want to pull.
+        
+    Returns
+    -------
+    dict
+        A dict containing the member's info.
+    """
+    
+    member_info = api_request(f'member/{member_id}')
+    return member_info.json()
+
+
 def encode_id(internal_id, is_user=False):
     """
     Return a base62-encoded version of a Letterboxd internal ID. The external 
