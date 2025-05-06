@@ -6,6 +6,8 @@ import base62
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+HEADERS = {'user-agent':'toolboxd-lbxd/1.0'}
+
 def api_request(path: str):
     """
     Wrapper for the Letterboxd API. Takes a path and returns the response from the API.
@@ -24,7 +26,8 @@ def api_request(path: str):
     LBXD_SECRET = os.environ['LBXD_SECRET']
     API_BASE = 'https://api.letterboxd.com/api/v0'
     
-    return letterboxd.api.API(api_base=API_BASE, api_key=LBXD_KEY, api_secret=LBXD_SECRET).api_call(path)
+    
+    return letterboxd.api.API(api_base=API_BASE, api_key=LBXD_KEY, api_secret=LBXD_SECRET).api_call(path, headers=HEADERS)
 
 
 def get_id_from_username(member_name):
@@ -44,7 +47,7 @@ def get_id_from_username(member_name):
         The API member ID of the member whose username you passed in.
     """
     
-    head_request = requests.head(f'https://letterboxd.com/{member_name}/')
+    head_request = requests.head(f'https://letterboxd.com/{member_name}/', headers=HEADERS)
     status_code = head_request.status_code
     if status_code != 200:
         raise ValueError(f'Request failed when looking up member {member_name}.\
