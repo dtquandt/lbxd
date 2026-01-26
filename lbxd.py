@@ -47,7 +47,7 @@ def get_id_from_username(member_name):
         The API member ID of the member whose username you passed in.
     """
     
-    head_request = requests.head(f'https://letterboxd.com/{member_name}/', headers=HEADERS)
+    head_request = requests.get(f'https://letterboxd.com/{member_name}/', headers=HEADERS)
     status_code = head_request.status_code
     if status_code != 200:
         raise ValueError(f'Request failed when looking up member {member_name}.\
