@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
    name='lbxd',
-   version='0.2',
+   version='0.3',
    py_modules=['lbxd'],
    description='Wrapper around the letterboxd library which is itself a wrapper around the Letterboxd API',
    author='Daniel Quandt',
