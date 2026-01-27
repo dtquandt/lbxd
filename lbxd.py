@@ -1,12 +1,35 @@
 import os
+import time
 import letterboxd
 import requests
 import pandas as pd
 import base62
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from requests.adapters import HTTPAdapter
 
-HEADERS = {'user-agent':'toolboxd-lbxd/1.0'}
+HEADERS = {'user-agent': 'toolboxd-lbxd/1.0'}
+MAX_POOL_SIZE = 150
+
+# Module-level API client (created once on first use)
+_api_client = None
+
+
+def _get_api_client():
+    """Get or create the singleton API client."""
+    global _api_client
+    if _api_client is None:
+        LBXD_KEY = os.environ['LBXD_KEY']
+        LBXD_SECRET = os.environ['LBXD_SECRET']
+        API_BASE = 'https://api.letterboxd.com/api/v0'
+        _api_client = letterboxd.api.API(api_base=API_BASE, api_key=LBXD_KEY, api_secret=LBXD_SECRET)
+        
+        # Configure connection pool to handle concurrent requests
+        adapter = HTTPAdapter(pool_connections=MAX_POOL_SIZE, pool_maxsize=MAX_POOL_SIZE)
+        _api_client.session.mount('https://', adapter)
+        _api_client.session.mount('http://', adapter)
+    return _api_client
+
 
 def api_request(path: str):
     """
@@ -22,12 +45,7 @@ def api_request(path: str):
     requests.models.Response
         The response from the API.
     """
-    LBXD_KEY = os.environ['LBXD_KEY']
-    LBXD_SECRET = os.environ['LBXD_SECRET']
-    API_BASE = 'https://api.letterboxd.com/api/v0'
-    
-    
-    return letterboxd.api.API(api_base=API_BASE, api_key=LBXD_KEY, api_secret=LBXD_SECRET).api_call(path, headers=HEADERS)
+    return _get_api_client().api_call(path, headers=HEADERS)
 
 
 def get_id_from_username(member_name):
@@ -50,12 +68,12 @@ def get_id_from_username(member_name):
     head_request = requests.get(f'https://letterboxd.com/{member_name}/', headers=HEADERS)
     status_code = head_request.status_code
     if status_code != 200:
-        raise ValueError(f'Request failed when looking up member {member_name}.\
-                           Status code: {status_code}')
+        raise ValueError(f'Request failed when looking up member {member_name}. '
+                        f'Status code: {status_code}')
     res_headers = head_request.headers
 
     if 'X-Letterboxd-Identifier' not in res_headers:
-        raise KeyError(f'Page headers did not include Letterboxd Identifier. Possible change on their side?')
+        raise KeyError('Page headers did not include Letterboxd Identifier. Possible change on their side?')
     member_id = res_headers['X-Letterboxd-Identifier']
     return member_id
 
@@ -66,9 +84,7 @@ def get_member_watchlist(member_id):
     
     Parameters
     ----------
-    member_name : str, optional
-        The username of the member whose watchlist you want to pull.
-    member_id : str, optional
+    member_id : str
         The member ID of the member whose watchlist you want to pull.
         
     Returns
@@ -83,14 +99,14 @@ def get_member_watchlist(member_id):
         wl_response = api_request(f'member/{member_id}/watchlist?perPage=100&cursor={cursor}')
         wl_response_status = wl_response.status_code
         if wl_response_status != 200:
-            raise ValueError(f'Request failed when pulling watchlist for member ID {member_id}.\
-                               Status code: {wl_response_status}')
+            raise ValueError(f'Request failed when pulling watchlist for member ID {member_id}. '
+                           f'Status code: {wl_response_status}')
         wl_json = wl_response.json()
         full_results.extend(wl_json['items'])
         if 'next' in wl_json.keys():
             paginate_watchlist(cursor=wl_json['next'])
     
-    paginate_watchlist(full_results)
+    paginate_watchlist()  # Fixed: was incorrectly passing full_results
     
     return pd.DataFrame(full_results)
 
@@ -137,7 +153,7 @@ def get_member_watches(member_id):
     """
     
     cursor = 'start=0'
-    results = {'next':None}
+    results = {'next': None}
     all_ratings = []
 
     while True:
@@ -161,11 +177,11 @@ def get_member_watches(member_id):
     return pd.DataFrame(all_ratings)
 
 
-def threaded_api_request(url_list, max_retries=15, max_threads=50, print_every=1000):
+def threaded_api_request(url_list, max_retries=5, max_threads=50, print_every=1000, 
+                         preserve_order=True, base_delay=1.0, respect_retry_after=True):
     """
     Return the results of a list of API requests. This function is multithreaded and will
-    retry failed requests up to max_retries times. It will also print a status update every
-    print_every requests.
+    retry failed requests up to max_retries times with exponential backoff.
     
     Parameters
     ----------
@@ -175,52 +191,91 @@ def threaded_api_request(url_list, max_retries=15, max_threads=50, print_every=1
         The number of times to retry a failed request. Defaults to 15.
     max_threads : int, optional
         The maximum number of threads to use. Defaults to 50.
+    print_every : int, optional
+        Print progress every N requests. Defaults to 1000.
+    preserve_order : bool, optional
+        If True, results are returned in the same order as url_list. Defaults to True.
+    base_delay : float, optional
+        Base delay in seconds for exponential backoff. Defaults to 1.0.
+    respect_retry_after : bool, optional
+        If True, respect Retry-After headers from 429 responses. Defaults to True.
     
     Returns
     -------
-    list
-        A list of the results of the API requests you passed in.
-    
+    tuple
+        (all_results, missing_urls, failed_urls)
+        - all_results: list of successful API responses (ordered if preserve_order=True)
+        - missing_urls: list of URLs that returned 404
+        - failed_urls: list of dicts with 'url' and 'reason' keys
     """
 
-    all_results = []
+    results_dict = {}
     missing_urls = []
     failed_urls = []
 
-    def error_handler(url):
-
+    def error_handler(url, index):
         retry_count = 0
+        last_error = None
 
         while True:
             try:
                 res = api_request(url)
-                return res.json()
-            except Exception as e:
-                if str(e)[0:3] == '404':
+                status_code = res.status_code
+                
+                if status_code == 200:
+                    return index, res.json()
+                elif status_code == 404:
                     missing_urls.append(url)
-                    return None
+                    return index, None
+                elif status_code == 429:
+                    last_error = 'HTTP 429 (rate limited)'
+                    if respect_retry_after:
+                        retry_after = res.headers.get('Retry-After')
+                        if retry_after:
+                            time.sleep(float(retry_after))
+                        else:
+                            time.sleep(base_delay * (2 ** retry_count))
+                    else:
+                        time.sleep(base_delay * (2 ** retry_count))
+                    retry_count += 1
+                else:
+                    last_error = f'HTTP {status_code}'
+                    raise Exception(last_error)
+                    
+            except Exception as e:
+                if last_error is None:
+                    last_error = str(e)
                 retry_count += 1
                 if retry_count > max_retries:
-                    failed_urls.append(url)
-                    print('Url failed after 15 retries.')
-                    return None
+                    failed_urls.append({'url': url, 'reason': last_error})
+                    print(f'URL failed after {max_retries} retries: {url} ({last_error})')
+                    return index, None
+                # Exponential backoff
+                time.sleep(base_delay * (2 ** min(retry_count, 6)))  # Cap at ~64 seconds
 
     def runner(url_list):
         count = 0
-        threads = [] 
         with ThreadPoolExecutor(max_workers=max_threads) as executor:
-            for url in url_list:
-                threads.append(executor.submit(error_handler, url))
-            for task in as_completed(threads):
-                entry = task.result()
-                if entry:
-                    all_results.append(entry)
+            futures = {executor.submit(error_handler, url, idx): idx 
+                      for idx, url in enumerate(url_list)}
+            
+            for task in as_completed(futures):
+                index, entry = task.result()
+                if entry is not None:
+                    results_dict[index] = entry
                 count += 1
                 if count % print_every == 0:
-                    print(f'{count} URLs processed so far.')
+                    print(f'{count}/{len(url_list)} URLs processed.')
 
-    print('Running scraper...')
+    print(f'Running scraper for {len(url_list)} URLs...')
     runner(url_list)
+    print(f'Complete. {len(results_dict)} successful, {len(missing_urls)} missing, {len(failed_urls)} failed.')
+    
+    if preserve_order:
+        # Return results in original order, filtering out None values
+        all_results = [results_dict[i] for i in sorted(results_dict.keys())]
+    else:
+        all_results = list(results_dict.values())
     
     return all_results, missing_urls, failed_urls
 
@@ -253,6 +308,8 @@ def encode_id(internal_id, is_user=False):
     ----------
     internal_id : int
         The internal ID you want to encode.
+    is_user : bool, optional
+        Whether the ID is for a user (vs a film). Defaults to False.
     
     Returns
     -------
@@ -260,9 +317,9 @@ def encode_id(internal_id, is_user=False):
         The base62-encoded version of the internal ID you passed in.
     """
     if is_user:
-        return base62.encode((internal_id*10) + 7, charset=base62.CHARSET_INVERTED)
+        return base62.encode((internal_id * 10) + 7, charset=base62.CHARSET_INVERTED)
     else:
-        return base62.encode(internal_id*10, charset=base62.CHARSET_INVERTED)
+        return base62.encode(internal_id * 10, charset=base62.CHARSET_INVERTED)
 
 
 def decode_id(external_id):
@@ -281,4 +338,4 @@ def decode_id(external_id):
         The base62-decoded version of the external ID you passed in.
     """
     
-    return int(base62.decode(external_id, charset=base62.CHARSET_INVERTED)/10)
+    return int(base62.decode(external_id, charset=base62.CHARSET_INVERTED) / 10)
