@@ -1,341 +1,412 @@
-import os
-import time
-import letterboxd
-import requests
-import pandas as pd
-import base62
+"""lbxd — a standalone Python client for the Letterboxd API.
 
+Signs requests itself (HMAC-SHA256 per the Letterboxd API spec) — no
+dependency on the abandoned ``letterboxd`` wrapper package.
+
+Public surface (stable since v0.x; downstream code relies on these contracts):
+
+* ``api_request(path)`` — one signed GET. Returns the ``requests.Response`` on
+  2xx and raises ``requests.HTTPError`` (with ``.response`` attached) on any
+  other status. Network failures raise ``requests.RequestException``;
+  timeouts raise ``requests.Timeout``.
+* ``get_id_from_username(name)`` — resolve a username to an API member id.
+  Raises ``LbxdNotFound`` (a ``ValueError`` subclass) for unknown users and
+  ``LbxdTransientError`` for upstream failures, so callers can tell a bad
+  username from an outage.
+* ``get_member_watches(member_id)`` — DataFrame of (member, film, rating).
+* ``get_member_watchlist(member_id)`` / ``get_combined_watchlists(ids)`` —
+  DataFrame(s) of raw watchlist items.
+* ``get_member_info(member_id)`` — raw member dict.
+* ``threaded_api_request(urls, ...)`` — concurrent GETs with retry/backoff.
+  404s fail fast into ``missing_urls``; 429s honour ``Retry-After``.
+* ``encode_id`` / ``decode_id`` — internal <-> external Letterboxd ids.
+
+Credentials come from the ``LBXD_KEY`` / ``LBXD_SECRET`` environment
+variables (or pass them to ``Client`` explicitly).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import logging
+import os
+import re
+import threading
+import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import base62
+import pandas as pd
+import requests
 from requests.adapters import HTTPAdapter
 
-HEADERS = {'user-agent': 'toolboxd-lbxd/1.0'}
-MAX_POOL_SIZE = 150
+__version__ = "1.0.0"
 
-# Module-level API client (created once on first use)
-_api_client = None
+log = logging.getLogger(__name__)
+log.addHandler(logging.NullHandler())
+
+API_BASE = "https://api.letterboxd.com/api/v0"
+WWW_BASE = "https://letterboxd.com"
+HEADERS = {"user-agent": f"toolboxd-lbxd/{__version__}"}
+
+# (connect, read) seconds — applied to every request this module makes.
+DEFAULT_TIMEOUT = (5.0, 30.0)
+
+# Sized ~2x the default worker count in threaded_api_request.
+POOL_SIZE = 100
+
+# How many Retry-After waits a single URL may burn in threaded_api_request
+# before it is declared failed (separate from the error-retry budget, which
+# would otherwise let a persistent rate limit loop forever).
+RATE_LIMIT_MAX_WAITS = 10
+
+# Letterboxd usernames are letters/digits/underscores; hyphens tolerated for
+# legacy accounts. Anything else would be path injection into the lookup URL.
+_USERNAME_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
 
 
-def _get_api_client():
-    """Get or create the singleton API client."""
-    global _api_client
-    if _api_client is None:
-        LBXD_KEY = os.environ['LBXD_KEY']
-        LBXD_SECRET = os.environ['LBXD_SECRET']
-        API_BASE = 'https://api.letterboxd.com/api/v0'
-        _api_client = letterboxd.api.API(api_base=API_BASE, api_key=LBXD_KEY, api_secret=LBXD_SECRET)
-        
-        # Configure connection pool to handle concurrent requests
-        adapter = HTTPAdapter(pool_connections=MAX_POOL_SIZE, pool_maxsize=MAX_POOL_SIZE)
-        _api_client.session.mount('https://', adapter)
-        _api_client.session.mount('http://', adapter)
-    return _api_client
+class LbxdError(Exception):
+    """Base class for errors raised by this module."""
 
 
-def api_request(path: str):
+class LbxdNotFound(LbxdError, ValueError):
+    """The requested member/resource does not exist (HTTP 404).
+
+    Subclasses ``ValueError`` because callers historically caught that from
+    ``get_id_from_username`` to mean "no such user".
     """
-    Wrapper for the Letterboxd API. Takes a path and returns the response from the API.
-    
+
+
+class LbxdInvalidUsername(LbxdNotFound):
+    """The username contains characters Letterboxd usernames can't have."""
+
+
+class LbxdTransientError(LbxdError):
+    """A transient upstream failure (5xx, rate limit, network) — not a 404.
+
+    Deliberately *not* a ``ValueError``: an outage must never be reported to
+    users as "no such username".
+    """
+
+
+class Client:
+    """Signed HTTP client for the Letterboxd API.
+
+    Thread-safe for concurrent GETs: the underlying ``requests.Session``
+    connection pool is shared and no per-request state is stored on ``self``.
+    """
+
+    def __init__(self, api_key=None, api_secret=None, timeout=DEFAULT_TIMEOUT,
+                 session=None):
+        self.api_key = api_key or os.environ.get("LBXD_KEY")
+        self.api_secret = api_secret or os.environ.get("LBXD_SECRET")
+        if not self.api_key or not self.api_secret:
+            raise LbxdError(
+                "Letterboxd API credentials missing: set the LBXD_KEY and "
+                "LBXD_SECRET environment variables (or pass api_key/api_secret)."
+            )
+        self.timeout = timeout
+        self.session = session or requests.Session()
+        adapter = HTTPAdapter(pool_connections=POOL_SIZE, pool_maxsize=POOL_SIZE)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+
+    def get(self, path: str) -> requests.Response:
+        """One signed GET of an API path (which may carry its own query string).
+
+        Returns the ``Response`` on 2xx; raises ``requests.HTTPError`` with
+        ``.response`` attached otherwise.
+        """
+        url = f"{API_BASE}/{path}"
+        params = {
+            "apikey": self.api_key,
+            "nonce": str(uuid.uuid4()),
+            "timestamp": int(time.time()),
+        }
+        request = requests.Request("GET", url, params=params, headers=HEADERS)
+        prepared = self.session.prepare_request(request)
+        signature = self._sign(prepared.method, prepared.url, prepared.body)
+        prepared.prepare_url(prepared.url, {"signature": signature})
+        response = self.session.send(prepared, timeout=self.timeout)
+        response.raise_for_status()
+        return response
+
+    def _sign(self, method: str, url: str, body=None) -> str:
+        """HMAC-SHA256 of ``[METHOD]\\x00[URL]\\x00[BODY]`` with the API secret.
+
+        The URL must already include apikey/nonce/timestamp; the resulting
+        hex digest is appended as the final ``signature`` query parameter.
+        """
+        if body is None:
+            body = b""
+        elif not isinstance(body, bytes):
+            body = str(body).encode()
+        message = b"\x00".join([method.upper().encode(), url.encode(), body])
+        return hmac.new(self.api_secret.encode(), message, hashlib.sha256).hexdigest()
+
+
+# Module-level singleton so the whole process shares one connection pool.
+_client: Client | None = None
+_client_lock = threading.Lock()
+
+
+def _get_client() -> Client:
+    global _client
+    if _client is None:
+        with _client_lock:
+            if _client is None:
+                _client = Client()
+    return _client
+
+
+def api_request(path: str) -> requests.Response:
+    """Signed GET against the Letterboxd API.
+
     Parameters
     ----------
     path : str
-        The path to the API endpoint you want to call.
-    
+        The API path (may include a query string), e.g.
+        ``"member/abc123/watchlist?perPage=100"``.
+
     Returns
     -------
-    requests.models.Response
-        The response from the API.
+    requests.Response
+        The response on 2xx. Any other status raises ``requests.HTTPError``
+        with the response attached; network errors raise
+        ``requests.RequestException``.
     """
-    return _get_api_client().api_call(path, headers=HEADERS)
+    return _get_client().get(path)
 
 
-def get_id_from_username(member_name):
-    """
-    Return a member's ID from their username. This is necessary because the Letterboxd API
-    requires member IDs instead of usernames. Raises a ValueError if the API search request
-    fails or if no results are found.
-    
-    Parameters
-    ----------
-    member_name : str
-        The username of the member whose ID you want to pull.
-        
-    Returns
-    -------
-    str
-        The API member ID of the member whose username you passed in.
-    """
-    
-    head_request = requests.get(f'https://letterboxd.com/{member_name}/', headers=HEADERS)
-    status_code = head_request.status_code
-    if status_code != 200:
-        raise ValueError(f'Request failed when looking up member {member_name}. '
-                        f'Status code: {status_code}')
-    res_headers = head_request.headers
+def get_id_from_username(member_name: str) -> str:
+    """Resolve a Letterboxd username to its API member id.
 
-    if 'X-Letterboxd-Identifier' not in res_headers:
-        raise KeyError('Page headers did not include Letterboxd Identifier. Possible change on their side?')
-    member_id = res_headers['X-Letterboxd-Identifier']
+    The API takes member ids, not usernames, so this reads the
+    ``X-Letterboxd-Identifier`` header from the member's profile page on
+    the main site. A streamed GET is used because the CDN rejects HEAD
+    (403 as of 2026-07); streaming means the page body is never downloaded.
+
+    Raises
+    ------
+    LbxdInvalidUsername
+        If ``member_name`` isn't a possible Letterboxd username.
+    LbxdNotFound
+        If no member exists with that username (HTTP 404).
+    LbxdTransientError
+        For rate limits, 5xx, or other upstream failures — the username may
+        be perfectly valid.
+    """
+    if not isinstance(member_name, str) or not _USERNAME_RE.fullmatch(member_name):
+        raise LbxdInvalidUsername(f"{member_name!r} is not a valid Letterboxd username")
+
+    url = f"{WWW_BASE}/{member_name}/"
+    response = requests.get(url, headers=HEADERS, timeout=DEFAULT_TIMEOUT,
+                            allow_redirects=True, stream=True)
+    response.close()  # headers only; never pull the page body
+
+    if response.status_code == 404:
+        raise LbxdNotFound(f"No Letterboxd member found for username {member_name!r}")
+    if not response.ok:
+        raise LbxdTransientError(
+            f"Username lookup for {member_name!r} failed with HTTP "
+            f"{response.status_code}; the username may still be valid."
+        )
+
+    member_id = response.headers.get("X-Letterboxd-Identifier")
+    if not member_id:
+        raise LbxdTransientError(
+            "Profile response carried no X-Letterboxd-Identifier header; "
+            "possible upstream change."
+        )
     return member_id
 
 
-def get_member_watchlist(member_id):
+def get_member_watchlist(member_id: str) -> pd.DataFrame:
+    """Return a member's watchlist as a DataFrame of raw API film items.
+
+    An empty watchlist yields an empty DataFrame with an ``id`` column, so
+    ``df["id"]`` is always safe.
     """
-    Return a member's watchlist from the Letterboxd API.
-    
-    Parameters
-    ----------
-    member_id : str
-        The member ID of the member whose watchlist you want to pull.
-        
+    items = []
+    cursor = "start=0"
+    while True:
+        response = api_request(f"member/{member_id}/watchlist?perPage=100&cursor={cursor}")
+        payload = response.json()
+        items.extend(payload["items"])
+        cursor = payload.get("next")
+        if not cursor:
+            break
+    if not items:
+        return pd.DataFrame(columns=["id"])
+    return pd.DataFrame(items)
+
+
+def get_combined_watchlists(member_ids) -> pd.DataFrame:
+    """Return the concatenated watchlists of several members."""
+    frames = [get_member_watchlist(member_id) for member_id in member_ids]
+    if not frames:
+        return pd.DataFrame(columns=["id"])
+    return pd.concat(frames, ignore_index=True)
+
+
+def get_member_watches(member_id: str) -> pd.DataFrame:
+    """Return a member's watched films and ratings.
+
     Returns
     -------
     pd.DataFrame
-        A DataFrame containing the member's watchlist.
+        Columns ``member``, ``film``, ``rating`` (NaN where the film was
+        watched but not rated). The columns are present even when the
+        member has no watches.
     """
-        
-    full_results = []
-    
-    def paginate_watchlist(cursor='start=0'):    
-        wl_response = api_request(f'member/{member_id}/watchlist?perPage=100&cursor={cursor}')
-        wl_response_status = wl_response.status_code
-        if wl_response_status != 200:
-            raise ValueError(f'Request failed when pulling watchlist for member ID {member_id}. '
-                           f'Status code: {wl_response_status}')
-        wl_json = wl_response.json()
-        full_results.extend(wl_json['items'])
-        if 'next' in wl_json.keys():
-            paginate_watchlist(cursor=wl_json['next'])
-    
-    paginate_watchlist()  # Fixed: was incorrectly passing full_results
-    
-    return pd.DataFrame(full_results)
-
-
-def get_combined_watchlists(member_ids):
-    """
-    Return the combined watchlists of a list of members.
-    
-    Parameters
-    ----------
-    member_ids : list
-        A list of member IDs whose watchlists you want to combine.
-        
-    Returns
-    -------
-    pd.DataFrame
-        A DataFrame containing the combined watchlists of the members you passed in.
-    """
-    
-    watchlists = []
-    
-    for member_id in member_ids:
-        watchlist = get_member_watchlist(member_id)
-        watchlists.append(watchlist)
-    
-    combined_watchlist = pd.concat(watchlists)
-    
-    return combined_watchlist
-
-
-def get_member_watches(member_id):
-    """
-    Return a member's watched films and their ratings, if any, from the Letterboxd API.
-    
-    Parameters
-    ----------
-    member_id : str
-        The member ID of the member whose watches you want to pull.
-        
-    Returns
-    -------
-    pd.DataFrame
-        A DataFrame containing the member's watched films and their ratings, if any.
-    """
-    
-    cursor = 'start=0'
-    results = {'next': None}
-    all_ratings = []
-
+    rows = []
+    cursor = "start=0"
     while True:
         response = api_request(
-            f'films/?perPage=100&member={member_id}&memberRelationship=Watched&sort=MemberRatingHighToLow&cursor={cursor}')
-        results = response.json()
-        for item in results['items']:
-            entry = {'member': member_id}
-            entry['film'] = item.get('id')
-            relationships = item.get('relationships')
+            f"films/?perPage=100&member={member_id}"
+            f"&memberRelationship=Watched&sort=MemberRatingHighToLow&cursor={cursor}"
+        )
+        payload = response.json()
+        for item in payload["items"]:
+            rating = None
+            relationships = item.get("relationships") or []
             if relationships:
-                relationship = relationships[0].get('relationship')
-                if relationship:
-                    entry['rating'] = relationship.get('rating')
-            all_ratings.append(entry)
-        if 'next' not in results:
+                relationship = relationships[0].get("relationship") or {}
+                rating = relationship.get("rating")
+            rows.append({"member": member_id, "film": item.get("id"), "rating": rating})
+        cursor = payload.get("next")
+        if not cursor:
             break
-        else:
-            cursor = results['next']
-        
-    return pd.DataFrame(all_ratings)
+    return pd.DataFrame(rows, columns=["member", "film", "rating"])
 
 
-def threaded_api_request(url_list, max_retries=5, max_threads=50, print_every=1000, 
+def get_member_info(member_id: str) -> dict:
+    """Return a member's raw info dict from the API."""
+    return api_request(f"member/{member_id}").json()
+
+
+def _retry_after_seconds(response, fallback: float) -> float:
+    """Parse a Retry-After header (delta-seconds form); fall back if absent/odd."""
+    value = response.headers.get("Retry-After") if response is not None else None
+    if value:
+        try:
+            return max(float(value), 0.0)
+        except (TypeError, ValueError):
+            pass
+    return fallback
+
+
+def threaded_api_request(url_list, max_retries=5, max_threads=50, print_every=1000,
                          preserve_order=True, base_delay=1.0, respect_retry_after=True):
-    """
-    Return the results of a list of API requests. This function is multithreaded and will
-    retry failed requests up to max_retries times with exponential backoff.
-    
+    """Fetch a list of API paths concurrently, with retry and backoff.
+
+    404s are *not* retried: they go straight to ``missing_urls``. 429s honour
+    ``Retry-After`` (when ``respect_retry_after``) on a separate budget of
+    ``RATE_LIMIT_MAX_WAITS`` waits. 5xx and network errors are retried up to
+    ``max_retries`` times with exponential backoff.
+
     Parameters
     ----------
     url_list : list
-        A list of API endpoints you want to call.
+        API paths to fetch (as accepted by ``api_request``).
     max_retries : int, optional
-        The number of times to retry a failed request. Defaults to 15.
+        Retries per URL for 5xx/network errors. Defaults to 5.
     max_threads : int, optional
-        The maximum number of threads to use. Defaults to 50.
+        Worker thread count. Defaults to 50.
     print_every : int, optional
-        Print progress every N requests. Defaults to 1000.
+        Log progress every N completed URLs. Defaults to 1000.
     preserve_order : bool, optional
-        If True, results are returned in the same order as url_list. Defaults to True.
+        If True, successful results come back in ``url_list`` order
+        (missing/failed URLs are omitted). Defaults to True.
     base_delay : float, optional
-        Base delay in seconds for exponential backoff. Defaults to 1.0.
+        Base for exponential backoff, in seconds. Defaults to 1.0.
     respect_retry_after : bool, optional
-        If True, respect Retry-After headers from 429 responses. Defaults to True.
-    
+        Honour 429 ``Retry-After`` headers. Defaults to True.
+
     Returns
     -------
     tuple
-        (all_results, missing_urls, failed_urls)
-        - all_results: list of successful API responses (ordered if preserve_order=True)
-        - missing_urls: list of URLs that returned 404
-        - failed_urls: list of dicts with 'url' and 'reason' keys
+        ``(all_results, missing_urls, failed_urls)`` —
+        parsed-JSON results, URLs that 404ed, and
+        ``{"url", "reason"}`` dicts for URLs that exhausted retries.
     """
-
     results_dict = {}
     missing_urls = []
     failed_urls = []
 
-    def error_handler(url, index):
-        retry_count = 0
-        last_error = None
-
+    def fetch(url, index):
+        retries = 0
+        rate_limit_waits = 0
         while True:
+            last_error = None
             try:
-                res = api_request(url)
-                status_code = res.status_code
-                
-                if status_code == 200:
-                    return index, res.json()
-                elif status_code == 404:
+                response = api_request(url)
+                return index, response.json()
+            except requests.HTTPError as exc:
+                resp = exc.response
+                status = resp.status_code if resp is not None else None
+                if status == 404:
                     missing_urls.append(url)
                     return index, None
-                elif status_code == 429:
-                    last_error = 'HTTP 429 (rate limited)'
-                    if respect_retry_after:
-                        retry_after = res.headers.get('Retry-After')
-                        if retry_after:
-                            time.sleep(float(retry_after))
+                if status == 429:
+                    rate_limit_waits += 1
+                    if rate_limit_waits <= RATE_LIMIT_MAX_WAITS:
+                        if respect_retry_after:
+                            delay = _retry_after_seconds(
+                                resp, base_delay * (2 ** min(rate_limit_waits, 6)))
                         else:
-                            time.sleep(base_delay * (2 ** retry_count))
-                    else:
-                        time.sleep(base_delay * (2 ** retry_count))
-                    retry_count += 1
+                            delay = base_delay * (2 ** min(rate_limit_waits, 6))
+                        time.sleep(delay)
+                        continue
+                    last_error = f"HTTP 429 (rate limited, {rate_limit_waits - 1} waits)"
                 else:
-                    last_error = f'HTTP {status_code}'
-                    raise Exception(last_error)
-                    
-            except Exception as e:
-                if last_error is None:
-                    last_error = str(e)
-                retry_count += 1
-                if retry_count > max_retries:
-                    failed_urls.append({'url': url, 'reason': last_error})
-                    print(f'URL failed after {max_retries} retries: {url} ({last_error})')
-                    return index, None
-                # Exponential backoff
-                time.sleep(base_delay * (2 ** min(retry_count, 6)))  # Cap at ~64 seconds
+                    last_error = f"HTTP {status}"
+            except requests.RequestException as exc:
+                last_error = repr(exc)
 
-    def runner(url_list):
-        count = 0
-        with ThreadPoolExecutor(max_workers=max_threads) as executor:
-            futures = {executor.submit(error_handler, url, idx): idx 
-                      for idx, url in enumerate(url_list)}
-            
-            for task in as_completed(futures):
-                index, entry = task.result()
-                if entry is not None:
-                    results_dict[index] = entry
-                count += 1
-                if count % print_every == 0:
-                    print(f'{count}/{len(url_list)} URLs processed.')
+            retries += 1
+            if retries > max_retries:
+                failed_urls.append({"url": url, "reason": last_error})
+                log.warning("URL failed after %d retries: %s (%s)",
+                            max_retries, url, last_error)
+                return index, None
+            time.sleep(base_delay * (2 ** min(retries, 6)))
 
-    print(f'Running scraper for {len(url_list)} URLs...')
-    runner(url_list)
-    print(f'Complete. {len(results_dict)} successful, {len(missing_urls)} missing, {len(failed_urls)} failed.')
-    
+    log.info("Fetching %d URLs with %d threads...", len(url_list), max_threads)
+    completed = 0
+    with ThreadPoolExecutor(max_workers=max_threads) as executor:
+        futures = [executor.submit(fetch, url, idx) for idx, url in enumerate(url_list)]
+        for future in as_completed(futures):
+            index, entry = future.result()
+            if entry is not None:
+                results_dict[index] = entry
+            completed += 1
+            if print_every and completed % print_every == 0:
+                log.info("%d/%d URLs processed.", completed, len(url_list))
+    log.info("Complete: %d successful, %d missing, %d failed.",
+             len(results_dict), len(missing_urls), len(failed_urls))
+
     if preserve_order:
-        # Return results in original order, filtering out None values
-        all_results = [results_dict[i] for i in sorted(results_dict.keys())]
+        all_results = [results_dict[i] for i in sorted(results_dict)]
     else:
         all_results = list(results_dict.values())
-    
+
     return all_results, missing_urls, failed_urls
 
 
-def get_member_info(member_id):
-    """
-    Return a member's info from the Letterboxd API.
-    
-    Parameters
-    ----------
-    member_id : str
-        The member ID of the member whose info you want to pull.
-        
-    Returns
-    -------
-    dict
-        A dict containing the member's info.
-    """
-    
-    member_info = api_request(f'member/{member_id}')
-    return member_info.json()
+def encode_id(internal_id: int, is_user: bool = False) -> str:
+    """Encode a Letterboxd internal numeric id to the external base62 form.
 
-
-def encode_id(internal_id, is_user=False):
-    """
-    Return a base62-encoded version of a Letterboxd internal ID. The external 
-    ID is used by the Letterboxd API for both members and films.
-    
-    Parameters
-    ----------
-    internal_id : int
-        The internal ID you want to encode.
-    is_user : bool, optional
-        Whether the ID is for a user (vs a film). Defaults to False.
-    
-    Returns
-    -------
-    str
-        The base62-encoded version of the internal ID you passed in.
+    The external id is what the API uses for both members and films. Member
+    ids carry a check digit of 7; film ids a check digit of 0.
     """
     if is_user:
         return base62.encode((internal_id * 10) + 7, charset=base62.CHARSET_INVERTED)
-    else:
-        return base62.encode(internal_id * 10, charset=base62.CHARSET_INVERTED)
+    return base62.encode(internal_id * 10, charset=base62.CHARSET_INVERTED)
 
 
-def decode_id(external_id):
-    """
-    Return a base62-decoded internal id from a Letterboxd external ID used
-    by the Letterboxd API for both members and films.    
-    
-    Parameters
-    ----------
-    external_id : str
-        The external ID you want to decode.
-    
-    Returns
-    -------
-    int
-        The base62-decoded version of the external ID you passed in.
-    """
-    
-    return int(base62.decode(external_id, charset=base62.CHARSET_INVERTED) / 10)
+def decode_id(external_id: str) -> int:
+    """Decode an external base62 Letterboxd id back to the internal numeric id."""
+    return base62.decode(external_id, charset=base62.CHARSET_INVERTED) // 10
