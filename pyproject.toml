@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lbxd"
+version = "1.0.0"
+description = "Standalone Python client for the Letterboxd API (signed requests, thread-safe, no wrapper dependencies)"
+authors = [{ name = "Daniel Quandt", email = "danieltquandt@gmail.com" }]
+requires-python = ">=3.10"
+dependencies = [
+    "requests",
+    "pandas",
+    "pybase62",
+]
+
+[tool.setuptools]
+py-modules = ["lbxd"]

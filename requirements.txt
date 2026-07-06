@@ -1,3 +1,0 @@
-pandas
-letterboxd
-pybase62
