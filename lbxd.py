@@ -42,7 +42,7 @@ import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 log = logging.getLogger(__name__)
 log.addHandler(logging.NullHandler())
@@ -65,6 +65,13 @@ RATE_LIMIT_MAX_WAITS = 10
 # Letterboxd usernames are letters/digits/underscores; hyphens tolerated for
 # legacy accounts. Anything else would be path injection into the lookup URL.
 _USERNAME_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
+
+# Listing pagination: cursors are predictable ("start=N", verified live), so
+# after page one the remaining pages are fetched speculatively in parallel.
+# Out-of-range cursors return an empty page (200, no "next") — also verified —
+# so overshooting past the end is harmless.
+PAGE_SIZE = 100
+PARALLEL_PAGE_WORKERS = 6  # polite ceiling for one member's pagination
 
 
 class LbxdError(Exception):
@@ -223,21 +230,54 @@ def get_id_from_username(member_name: str) -> str:
     return member_id
 
 
+def _fetch_all_pages(path_without_cursor: str) -> list:
+    """Fetch every page of a paginated listing, in page order.
+
+    Page one is fetched alone; if a ``next`` cursor exists, later pages are
+    fetched speculatively in waves of ``PARALLEL_PAGE_WORKERS`` (cursors are
+    ``start=N``). A wave stops the loop once any page in it is terminal (no
+    ``next``); overshot pages come back empty and contribute nothing. Any page
+    failure propagates as the usual ``requests`` exception.
+    """
+    sep = "&" if "?" in path_without_cursor else "?"
+
+    def fetch(start):
+        return api_request(f"{path_without_cursor}{sep}cursor=start={start}").json()
+
+    first = fetch(0)
+    items = list(first["items"])
+    if not first.get("next"):
+        return items
+
+    pages = {}
+    next_start = PAGE_SIZE
+    with ThreadPoolExecutor(max_workers=PARALLEL_PAGE_WORKERS) as executor:
+        while True:
+            wave = range(next_start, next_start + PAGE_SIZE * PARALLEL_PAGE_WORKERS,
+                         PAGE_SIZE)
+            futures = {start: executor.submit(fetch, start) for start in wave}
+            terminal = False
+            for start, future in futures.items():
+                payload = future.result()
+                pages[start] = payload["items"]
+                if not payload.get("next"):
+                    terminal = True
+            if terminal:
+                break
+            next_start = wave[-1] + PAGE_SIZE
+
+    for start in sorted(pages):
+        items.extend(pages[start])
+    return items
+
+
 def get_member_watchlist(member_id: str) -> pd.DataFrame:
     """Return a member's watchlist as a DataFrame of raw API film items.
 
-    An empty watchlist yields an empty DataFrame with an ``id`` column, so
-    ``df["id"]`` is always safe.
+    Pages are fetched in parallel after the first. An empty watchlist yields
+    an empty DataFrame with an ``id`` column, so ``df["id"]`` is always safe.
     """
-    items = []
-    cursor = "start=0"
-    while True:
-        response = api_request(f"member/{member_id}/watchlist?perPage=100&cursor={cursor}")
-        payload = response.json()
-        items.extend(payload["items"])
-        cursor = payload.get("next")
-        if not cursor:
-            break
+    items = _fetch_all_pages(f"member/{member_id}/watchlist?perPage=100")
     if not items:
         return pd.DataFrame(columns=["id"])
     return pd.DataFrame(items)
@@ -261,24 +301,18 @@ def get_member_watches(member_id: str) -> pd.DataFrame:
         watched but not rated). The columns are present even when the
         member has no watches.
     """
+    items = _fetch_all_pages(
+        f"films/?perPage=100&member={member_id}"
+        f"&memberRelationship=Watched&sort=MemberRatingHighToLow"
+    )
     rows = []
-    cursor = "start=0"
-    while True:
-        response = api_request(
-            f"films/?perPage=100&member={member_id}"
-            f"&memberRelationship=Watched&sort=MemberRatingHighToLow&cursor={cursor}"
-        )
-        payload = response.json()
-        for item in payload["items"]:
-            rating = None
-            relationships = item.get("relationships") or []
-            if relationships:
-                relationship = relationships[0].get("relationship") or {}
-                rating = relationship.get("rating")
-            rows.append({"member": member_id, "film": item.get("id"), "rating": rating})
-        cursor = payload.get("next")
-        if not cursor:
-            break
+    for item in items:
+        rating = None
+        relationships = item.get("relationships") or []
+        if relationships:
+            relationship = relationships[0].get("relationship") or {}
+            rating = relationship.get("rating")
+        rows.append({"member": member_id, "film": item.get("id"), "rating": rating})
     return pd.DataFrame(rows, columns=["member", "film", "rating"])
 
 

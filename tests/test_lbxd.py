@@ -50,12 +50,31 @@ class FakeApi:
     def route(self, substring, *responses):
         self.routes.append((substring, list(responses)))
 
+    def route_pages(self, substring, total_items, id_prefix="f", item_extra=None):
+        """Serve a paginated listing keyed by the request's cursor=start=N."""
+        def handler(prepared):
+            q = parse_qs(urlsplit(prepared.url).query)
+            start = int(q.get("cursor", ["start=0"])[0].split("=", 1)[1])
+            items = [
+                {"id": f"{id_prefix}{i}", **(item_extra(i) if item_extra else {})}
+                for i in range(start, min(start + 100, total_items))
+            ]
+            payload = {"items": items}
+            if start + 100 < total_items:
+                payload["next"] = f"start={start + 100}"
+            return make_response(200, payload)
+
+        self.routes.append((substring, handler))
+
     def _send(self, prepared, timeout=None, **kwargs):
         assert timeout is not None, "every request must carry a timeout"
         self.sent.append(prepared)
         for substring, responses in self.routes:
             if substring in prepared.url:
-                resp = responses.pop(0) if len(responses) > 1 else responses[0]
+                if callable(responses):
+                    resp = responses(prepared)
+                else:
+                    resp = responses.pop(0) if len(responses) > 1 else responses[0]
                 resp.request = prepared
                 return resp
         raise AssertionError(f"no fake route for {prepared.url}")
@@ -190,21 +209,19 @@ def test_invalid_usernames_rejected_without_http(monkeypatch):
 
 
 def test_get_member_watches_paginates_and_shapes(fake_api):
-    page1 = {
-        "items": [
-            {"id": "f1", "relationships": [{"relationship": {"rating": 4.5}}]},
-            {"id": "f2", "relationships": []},
-        ],
-        "next": "start=100",
-    }
-    page2 = {"items": [{"id": "f3", "relationships": [{"relationship": {}}]}]}
-    fake_api.route("films/", make_response(200, page1), make_response(200, page2))
-
+    # 230 items across 3 pages; rating present only on multiples of 3.
+    fake_api.route_pages(
+        "films/", 230,
+        item_extra=lambda i: {
+            "relationships": [{"relationship": {"rating": 4.0}}] if i % 3 == 0 else []
+        },
+    )
     df = lbxd.get_member_watches("m1")
     assert list(df.columns) == ["member", "film", "rating"]
-    assert df["film"].tolist() == ["f1", "f2", "f3"]
-    assert df["rating"].iloc[0] == 4.5
-    assert pd.isna(df["rating"].iloc[1]) and pd.isna(df["rating"].iloc[2])
+    assert len(df) == 230
+    assert df["film"].tolist() == [f"f{i}" for i in range(230)], "page order preserved"
+    assert df["rating"].iloc[0] == 4.0
+    assert pd.isna(df["rating"].iloc[1])
 
 
 def test_get_member_watches_empty_has_columns(fake_api):
@@ -214,18 +231,27 @@ def test_get_member_watches_empty_has_columns(fake_api):
     assert list(df.columns) == ["member", "film", "rating"]
 
 
-def test_get_member_watchlist_paginates_iteratively(fake_api):
-    # 1,500 pages would blow the old recursive implementation's stack.
-    pages = [
-        make_response(200, {"items": [{"id": f"f{i}"}], "next": f"start={i + 1}"})
-        for i in range(1500)
-    ]
-    pages.append(make_response(200, {"items": [{"id": "last"}]}))
-    fake_api.route("watchlist", *pages)
-
+def test_get_member_watchlist_parallel_pages_ordered(fake_api):
+    # 2,050 items = 21 pages = several speculative waves, ends mid-wave.
+    fake_api.route_pages("watchlist", 2050)
     df = lbxd.get_member_watchlist("m1")
-    assert len(df) == 1501
-    assert df["id"].iloc[-1] == "last"
+    assert len(df) == 2050
+    assert df["id"].tolist() == [f"f{i}" for i in range(2050)], "page order preserved"
+
+
+def test_single_page_listing_makes_one_request(fake_api):
+    fake_api.route_pages("watchlist", 40)  # no "next" on page one
+    df = lbxd.get_member_watchlist("m1")
+    assert len(df) == 40
+    assert len(fake_api.sent) == 1, "no speculative fetches when page one is terminal"
+
+
+def test_overshoot_pages_are_harmless(fake_api):
+    # 150 items: page one has next; wave overshoots far past the end.
+    fake_api.route_pages("watchlist", 150)
+    df = lbxd.get_member_watchlist("m1")
+    assert len(df) == 150
+    assert df["id"].tolist() == [f"f{i}" for i in range(150)]
 
 
 def test_get_member_watchlist_empty_has_id_column(fake_api):
